@@ -331,28 +331,29 @@ def get_dynamic_slippage(liquidity_usd: float, amount_sol: float, sol_price_usd:
 
 # ── JUPITER SWAP ───────────────────────────────────────────────────────────────
 async def jupiter_swap(user_id: str, from_token: str, to_token: str, amount_sol: float) -> dict:
-    """
-    Execute a swap via Jupiter. Enforces all risk rules.
-
-    NOTE: This function gets a quote and logs the intended trade but does NOT
-    sign or broadcast a transaction — the user must sign with their own wallet.
-    Private keys are never held server-side.
-    """
+    """Execute a real swap via Jupiter — signs and broadcasts on-chain."""
     try:
-        w = get_user_wallet(user_id)
-        if not w:
-            return {"ok": False, "error": "No wallet linked. Use /mywallet to set up your wallet address."}
+        # Load private key from .env
+        pk_b58 = os.getenv("WALLET_PRIVATE_KEY", "")
+        if not pk_b58:
+            return {"ok": False, "error": "No WALLET_PRIVATE_KEY set in .env"}
+
+        from base58 import b58decode
+        kp = Keypair.from_bytes(b58decode(pk_b58))
+        address = str(kp.pubkey())
 
         known = {
-            "sol":    SOL_MINT,
-            "usdc":   USDC_MINT,
-            "brotha": BROTHA_MINT,
+            "sol":  SOL_MINT,
+            "usdc": USDC_MINT,
         }
+        brotha_mint = os.getenv("BROTHA_MINT", "")
+        if brotha_mint:
+            known["brotha"] = brotha_mint
+
         from_mint = known.get(from_token.lower(), from_token)
         to_mint   = known.get(to_token.lower(), to_token)
 
-        bal = get_sol_balance_sync(w["address"])
-
+        bal = get_sol_balance_sync(address)
         ok, reason = check_risk_rules(user_id, amount_sol, bal)
         if not ok:
             return {"ok": False, "error": reason}
@@ -360,34 +361,67 @@ async def jupiter_swap(user_id: str, from_token: str, to_token: str, amount_sol:
         token_info = get_token_info(to_mint) if from_mint == SOL_MINT else {}
         liq        = token_info.get("liquidity", 50000) if token_info.get("ok") else 50000
         slippage   = get_dynamic_slippage(liq, amount_sol)
-
         amount_lamports = int(amount_sol * 1e9)
-        fee             = amount_sol * BOT_FEE_PCT
 
         async with httpx.AsyncClient(timeout=15) as c:
+            # Step 1: Get quote
             quote_resp = await c.get(JUPITER_QUOTE, params={
                 "inputMint":   from_mint,
                 "outputMint":  to_mint,
                 "amount":      amount_lamports,
                 "slippageBps": slippage,
             })
-        quote = quote_resp.json()
-        if "error" in quote:
-            return {"ok": False, "error": quote["error"]}
+            quote = quote_resp.json()
+            if "error" in quote:
+                return {"ok": False, "error": quote["error"]}
 
-        out_amount   = int(quote.get("outAmount", 0))
-        price_impact = float(quote.get("priceImpactPct", 0))
+            out_amount   = int(quote.get("outAmount", 0))
+            price_impact = float(quote.get("priceImpactPct", 0))
 
-        if price_impact > 5:
-            return {"ok": False, "error": f"Price impact too high: {price_impact:.1f}%. Trade smaller."}
+            if price_impact > 5:
+                return {"ok": False, "error": f"Price impact too high: {price_impact:.1f}%. Trade smaller."}
 
+            # Step 2: Get swap transaction
+            swap_resp = await c.post(JUPITER_SWAP, json={
+                "quoteResponse":         quote,
+                "userPublicKey":         address,
+                "wrapAndUnwrapSol":      True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": 1000,
+            })
+            swap_data = swap_resp.json()
+            if "error" in swap_data:
+                return {"ok": False, "error": swap_data["error"]}
+
+        # Step 3: Sign and send
+        import base64
+        from solders.transaction import VersionedTransaction
+        from solders.keypair import Keypair as SoldersKeypair
+
+        raw_tx = base64.b64decode(swap_data["swapTransaction"])
+        tx = VersionedTransaction.from_bytes(raw_tx)
+        signed_tx = VersionedTransaction(tx.message, [kp])
+        signed_bytes = base64.b64encode(bytes(signed_tx)).decode("utf-8")
+
+        async with httpx.AsyncClient(timeout=30) as c:
+            send_resp = await c.post(HELIUS_RPC_URL, json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [signed_bytes, {"encoding": "base64", "skipPreflight": False}]
+            })
+        result = send_resp.json()
+        if "error" in result:
+            return {"ok": False, "error": str(result["error"])}
+
+        signature = result.get("result", "unknown")
         symbol = token_info.get("symbol", to_token.upper()) if token_info.get("ok") else to_token.upper()
         price  = token_info.get("price_usd", 0) if token_info.get("ok") else 0
 
         with sqlite3.connect(DB_PATH) as db:
             db.execute(
                 "INSERT INTO trade_history (user_id,token_mint,token_symbol,action,amount_sol,price,signature) VALUES (?,?,?,?,?,?,?)",
-                (user_id, to_mint, symbol, "buy", amount_sol, price, "pending")
+                (user_id, to_mint, symbol, "buy", amount_sol, price, signature)
             )
             if from_mint == SOL_MINT:
                 db.execute(
@@ -400,16 +434,16 @@ async def jupiter_swap(user_id: str, from_token: str, to_token: str, amount_sol:
             "from":         from_token.upper(),
             "to":           symbol,
             "amount":       amount_sol,
-            "fee":          fee,
             "out_amount":   out_amount,
             "slippage_bps": slippage,
             "price_impact": price_impact,
-            "explorer":     f"https://solscan.io/account/{w['address']}",
+            "signature":    signature,
+            "explorer":     f"https://solscan.io/tx/{signature}",
         }
+
     except Exception as e:
         logger.error(f"Swap error: {e}")
         return {"ok": False, "error": str(e)}
-
 # ── POSITION MANAGEMENT ────────────────────────────────────────────────────────
 def get_open_positions(user_id: str) -> list:
     with sqlite3.connect(DB_PATH) as db:

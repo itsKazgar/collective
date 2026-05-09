@@ -14,9 +14,6 @@ BrothaB0T — telegram_bot.py  v6.0
 ✅ BROTHA token live price + ecosystem links
 ✅ Secrets loaded from .env — nothing hardcoded
 """
-from dotenv import load_dotenv
-load_dotenv(dotenv_path="/home/kazgar/BR0THA_bot/.env")
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  IMPORTS
@@ -763,7 +760,6 @@ Crypto: only if asked or relevant. You are not a ticker tape.
 Opinions: you have them. Share when it matters. Never force them.
 
 You never send money unprompted. Not one lamport.
-
 $BROTHA is the ecosystem token: CA {BROTHA_MINT}
 """
 
@@ -1031,17 +1027,6 @@ def format_brotha() -> str:
     )
 
 def tool_crypto(coin: str, rich: bool = False) -> str:
-    # General coin info request — highest priority
-    for phrase in ["info on", "tell me about", "what is", "show me", "details on", "everything about", "look up", "research", "check", "about"]:
-        if phrase in coin.lower():
-            token_q = coin.lower().replace(phrase, "").strip().split()[0] if coin.lower().replace(phrase, "").strip() else ""
-            skip = ["me","the","a","an","is","on","it","him","her","them","what","who","how","this","that","my","your","price","market"]
-            if token_q and token_q not in skip and len(token_q) > 1:
-                result = search_token(token_q)
-                if result.get("ok"):
-                    return tool_coin_info(token_q)
-            break
-
     if coin.lower() in ["brotha", "$brotha"]:
         return format_brotha()
     try:
@@ -1214,72 +1199,8 @@ def get_solana_balance_helius(wallet: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
-
-def tool_coin_info(query: str) -> str:
-    """Full coin info — price, CA, mcap, links. Always live from DexScreener."""
-    query = query.strip()
-    if not query:
-        return "Which coin? Example: info on bonk"
-    result = search_token(query)
-    if not result.get("ok"):
-        return f"❌ Could not find '{query}' on Solana.\nCheck: https://dexscreener.com/solana"
-    change = result.get("change_24h", 0) or 0
-    arrow = "📈" if change >= 0 else "📉"
-    return (
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"  {arrow}  {result['symbol']} — {result['name']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Price:    ${result['price']:.8f}\n"
-        f"🏦 MCap:     ${result['mcap']:,.0f}\n"
-        f"💧 Liq:      ${result['liq']:,.0f}\n"
-        f"🔑 CA:       {result['mint']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Source: DexScreener (live)\n"
-        f"🔗 {result['dex_url']}"
-    )
-
-def tool_ca_lookup(query: str) -> str:
-    """Look up contract address from DexScreener — never from AI memory."""
-    query = query.strip()
-    if not query:
-        return "Please specify a token. Example: ca of bonk"
-    result = search_token(query)
-    if result.get("ok") and result.get("mint"):
-        return (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"  🔍  {result['symbol']} Contract Address\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Symbol:  {result['symbol']}\n"
-            f"Name:    {result['name']}\n"
-            f"CA:      {result['mint']}\n"
-            f"MCap:    ${result['mcap']:,.0f}\n"
-            f"Price:   ${result['price']:.8f}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Source: DexScreener (live)\n"
-            f"🔗 {result['dex_url']}"
-        )
-    return (
-        f"❌ Could not find verified CA for '{query}'\n\n"
-        f"Check directly:\n"
-        f"• https://dexscreener.com/solana\n"
-        f"• https://birdeye.so\n"
-        f"• https://pump.fun"
-    )
-
 def detect_tool(text: str) -> str | None:
     t = text.lower().strip()
-    # Coin info — READ ONLY, no trading, runs before everything else
-    coin_info_match = re.search(
-        r"\b(info|tell me about|what is|show me|details|everything about|look up|research|about|check)\b.{0,20}\b([a-z0-9$]+)\b", t
-    )
-    if coin_info_match:
-        token_q = coin_info_match.group(2).replace("$","").strip()
-        skip = ["me","the","a","an","is","on","it","him","her","them","what","who","how","this","that","my","your","sol","btc","eth"]
-        if token_q not in skip and len(token_q) > 1:
-            result = search_token(token_q)
-            if result.get("ok"):
-                return tool_coin_info(token_q)
     if any(w in t for w in ["brotha", "$brotha"]):
         if any(w in t for w in ["price", "worth", "chart", "pump", "buy", "mc", "how much", "market"]):
             return format_brotha()
@@ -1302,11 +1223,6 @@ def detect_tool(text: str) -> str | None:
         q = re.sub(r"(search for|look up|find info on|search)", "", t).strip()
         if q:
             return f"🔍 '{q}'\n\n{tool_search(q)}"
-    # CA lookup — live DexScreener, never AI memory
-    if any(w in t for w in ["ca of", "ca for", "contract address", "contract of", "what is the ca", "give me the ca", "mint address", "token address"]):
-        token_q = re.sub(r"(ca of|ca for|contract address of|contract address|contract of|what is the ca of|give me the ca of|mint address of|token address of|what is the ca|give me the ca|the|of|for|is|what|give|me)", "", t).strip()
-        return tool_ca_lookup(token_q)
-
     return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2114,21 +2030,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if handled:
         save_memory(uid, "user", text)
         return
-
-    # Coin info — runs FIRST before anything else
-    for phrase in ["info on", "tell me about", "what is", "show me", "details on", "look up", "check", "research"]:
-        if phrase in text.lower():
-            token_q = ""
-            skip = ["me","the","a","an","is","on","it","him","her","them","what","who","how","this","that","my","your","price","market","sol","btc","eth"]
-            if token_q and token_q not in skip and len(token_q) > 1:
-                result = search_token(token_q)
-                if result.get("ok"):
-                    reply = tool_coin_info(token_q)
-                    await update.message.reply_text(reply)
-                    save_memory(uid, "user", text)
-                    save_memory(uid, "assistant", reply)
-                    return
-            break
 
     # Tool detection
     tool_result = detect_tool(text)
