@@ -1,7 +1,7 @@
 # BR0THA Bot 🤖
+> Solana AI trading dashboard powered by a multi-model agent council
 
 **🔴 Live Demo:** https://itskazgar.github.io/BR0THA_bot
-> Solana AI trading dashboard powered by a multi-model agent council
 
 A modular AI trading system where multiple AI models (Claude, GPT-4o, Grok, Gemini, Groq) vote on trades together. The council reaches consensus before any swap executes.
 
