@@ -61,7 +61,7 @@ try:
         set_alert, get_alerts, get_open_positions, get_portfolio_summary,
         get_position_pnl, close_position, check_and_manage_positions,
         create_dca_plan, get_dca_plans, cancel_dca, run_dca_plans,
-        set_signal, get_signals, check_signals, get_token_info, search_token,
+        set_signal, get_signals, check_signals, get_token_info, search_token, run_auto_strategies, scan_for_thesis, format_thesis_scan, set_auto_strategy, get_auto_strategies,
         is_trading_subscriber, get_subscription_info, activate_trading_sub,
         init_trading_tables, TRADING_WEEK_SOL, MAX_OPEN_TRADES, MAX_POSITION_PCT,
         RESERVE_PCT, TAKE_PROFIT_PCT, STOP_LOSS_PCT, MIN_MCAP_USD,
@@ -89,6 +89,11 @@ except ImportError:
     def get_dca_plans(uid): return []
     def cancel_dca(uid, plan_id): pass
     async def run_dca_plans(bot): pass
+    async def run_auto_strategies(bot): pass
+    def scan_for_thesis(thesis, limit=5): return []
+    def format_thesis_scan(thesis, results): return "Trading module not loaded"
+    def set_auto_strategy(uid, stype, config): pass
+    def get_auto_strategies(uid): return []
     def set_signal(*a, **kw): pass
     def get_signals(uid): return []
     def check_signals(uid): return []
@@ -105,6 +110,7 @@ except ImportError:
 #  CONFIG — all from .env, nothing hardcoded
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 OWNER_ID           = os.getenv("OWNER_ID", "")
 OWNER_USERNAME     = os.getenv("OWNER_USERNAME", "owner")
@@ -317,7 +323,7 @@ TIERS = {
     t: {
         "messages_per_hour": 999999,
         "messages_per_day":  999999,
-        "model":   "meta-llama/llama-3.3-70b-instruct",
+        "model":   os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5"),
         "trading": True,
         "label":   lbl,
     }
@@ -735,6 +741,7 @@ def count_custom_commands() -> int:
 #  AI PERSONALITY & ROUTING
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PERSONALITY = f"""You are Brotha — BrothaB0T.
+NEVER say your name. Never say 'Brotha' in a reply. Ever. Not once.
 
 Short first. Then deeper if they push.
 Never over-explain. Never lecture. Never shill.
@@ -767,21 +774,208 @@ You never send money unprompted. Not one lamport.
 $BROTHA is the ecosystem token: CA {BROTHA_MINT}
 """
 
+# ── MARKET CONTEXT INJECTION ──────────────────────────────────────────────────
+CRYPTO_KEYWORDS = {
+    "buy","sell","trade","pump","moon","rug","dex","swap","sol","btc","eth",
+    "token","mint","mcap","price","chart","graduating","raydium","jupiter",
+    "bonk","jup","wen","alpha","degen","ape","flip","thesis","momentum",
+    "breakout","dip","short","long","entry","stop","loss","profit","pnl",
+    "pump.fun","pumpfun","king","graduate","liquidity","volume","holders"
+}
+
+def needs_market_context(text: str) -> bool:
+    t = text.lower()
+    return any(w in t for w in CRYPTO_KEYWORDS)
+
+def get_quick_market_snapshot() -> str:
+    """Fast market context injected into AI prompt for crypto queries."""
+    try:
+        import requests as _req
+        lines = ["[LIVE MARKET — use this data in your response]"]
+
+        # CoinGecko prices + 24h change
+        try:
+            cg = _req.get(
+                "https://api.coingecko.com/api/v3/simple/price"
+                "?ids=solana,bitcoin,ethereum,bonk,jup-governance-token,raydium,jito-governance-token"
+                "&vs_currencies=usd&include_24hr_change=true",
+                timeout=8
+            ).json()
+            sol = cg.get("solana", {})
+            btc = cg.get("bitcoin", {})
+            eth = cg.get("ethereum", {})
+            bonk = cg.get("bonk", {})
+            jup = cg.get("jup-governance-token", {})
+            sol_dir = "↑" if sol.get("usd_24h_change", 0) > 0 else "↓"
+            btc_dir = "↑" if btc.get("usd_24h_change", 0) > 0 else "↓"
+            eth_dir = "↑" if eth.get("usd_24h_change", 0) > 0 else "↓"
+            lines.append(f"SOL: ${sol.get('usd',0):.2f} {sol_dir}{abs(sol.get('usd_24h_change',0)):.1f}% 24h")
+            lines.append(f"BTC: ${btc.get('usd',0):,.0f} {btc_dir}{abs(btc.get('usd_24h_change',0)):.1f}% 24h")
+            lines.append(f"ETH: ${eth.get('usd',0):,.0f} {eth_dir}{abs(eth.get('usd_24h_change',0)):.1f}% 24h")
+            if bonk.get("usd"):
+                lines.append(f"BONK: ${bonk.get('usd',0):.8f} {'+' if bonk.get('usd_24h_change',0)>0 else ''}{bonk.get('usd_24h_change',0):.1f}%")
+            if jup.get("usd"):
+                lines.append(f"JUP: ${jup.get('usd',0):.3f} {'+' if jup.get('usd_24h_change',0)>0 else ''}{jup.get('usd_24h_change',0):.1f}%")
+        except Exception as e:
+            logger.warning(f"CoinGecko price fetch failed: {e}")
+
+        # CoinGecko trending
+        try:
+            tr = _req.get("https://api.coingecko.com/api/v3/search/trending", timeout=8).json()
+            coins = tr.get("coins", [])
+            if coins:
+                trending_str = ", ".join(
+                    f"{c['item']['symbol']}({c['item'].get('data',{}).get('price_change_percentage_24h',{}).get('usd',0):+.0f}%)"
+                    for c in coins[:6]
+                )
+                lines.append(f"Trending: {trending_str}")
+        except Exception as e:
+            logger.warning(f"CoinGecko trending failed: {e}")
+
+        # DexScreener — hot new Solana tokens
+        try:
+            # Get trending token profiles on Solana
+            prof = _req.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8).json()
+            sol_mints = [p.get("tokenAddress") for p in (prof if isinstance(prof, list) else [])
+                         if p.get("chainId") == "solana"][:6]
+
+            if sol_mints:
+                mint_str = "%2C".join(sol_mints)
+                dx = _req.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint_str}", timeout=8).json()
+                pairs = dx.get("pairs") or []
+                seen = set()
+                hot = []
+                for p in pairs:
+                    sym = p.get("baseToken",{}).get("symbol","?")
+                    if sym in seen or sym in ["SOL","USDC","USDT","WSOL"]:
+                        continue
+                    seen.add(sym)
+                    hot.append(p)
+                hot = sorted(hot, key=lambda x: float(x.get("volume",{}).get("h24",0) or 0), reverse=True)[:5]
+                if hot:
+                    lines.append("🔥 Trending Solana (DexScreener):")
+                    for p in hot:
+                        sym = p.get("baseToken",{}).get("symbol","?")
+                        vol = float(p.get("volume",{}).get("h24",0) or 0)
+                        chg = float(p.get("priceChange",{}).get("h24",0) or 0)
+                        price = p.get("priceUsd") or "?"
+                        mcap = float(p.get("marketCap") or p.get("fdv") or 0)
+                        lines.append(f"  {sym}: ${price} {chg:+.1f}% | Vol ${vol:,.0f} | MCap ${mcap:,.0f}")
+        except Exception as e:
+            logger.warning(f"DexScreener fetch failed: {e}")
+
+        # Jupiter swap volume via CoinGecko (jup.ag blocked, use CG instead)
+        try:
+            jup_data = _req.get(
+                "https://api.coingecko.com/api/v3/coins/markets"
+                "?vs_currency=usd&ids=jup-governance-token,raydium,orca,marinade,jupiter-exchange-solana"
+                "&order=volume_desc&per_page=5",
+                timeout=8
+            ).json()
+            if jup_data:
+                lines.append("💱 Solana DEX tokens:")
+                for c in jup_data:
+                    chg = c.get("price_change_percentage_24h") or 0
+                    vol = c.get("total_volume") or 0
+                    lines.append(f"  {c['symbol'].upper()}: ${c.get('current_price',0):.3f} {chg:+.1f}% | Vol ${vol:,.0f}")
+        except Exception as e:
+            logger.warning(f"DEX tokens fetch failed: {e}")
+
+
+
+        # Pump.fun (best effort)
+        try:
+            from market_data import get_pumpfun_graduating, get_pumpfun_new
+            graduating = get_pumpfun_graduating(5)
+            if graduating:
+                lines.append("Near graduation (pump.fun→Raydium):")
+                for g in graduating[:3]:
+                    koh = " 👑" if g.get("king_of_hill") else ""
+                    lines.append(f"  {g['symbol']} ${g['mcap']:,.0f} — {g['pct_to_grad']:.0f}% to grad{koh}")
+            new_coins = get_pumpfun_new(5)
+            if new_coins:
+                lines.append(f"Fresh launches: {', '.join(c['symbol'] for c in new_coins[:5])}")
+        except Exception:
+            pass
+
+        lines.append("[END MARKET DATA]")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Market snapshot error: {e}")
+        return ""
+
+
 AGENT_SYSTEMS = {
-    "trader":     "You are Brotha's Trading Agent. Sharp, Solana-native. Concrete takes, always mention risk.\n\n",
-    "researcher": "You are Brotha's Research Agent. Deep, high-signal, thorough but not bloated.\n\n",
-    "scheduler":  "You are Brotha's Scheduler Agent. Help users automate tasks.\n\n",
-    "ordering":   "You are Brotha's Ordering Agent. Help buy things with crypto efficiently.\n\n",
-    "privacy":    "You are Brotha's Privacy Agent. Expert in on-chain privacy, mixing, anonymity.\n\n",
-    "assistant":  "You are Brotha's General Assistant. Help with anything.\n\n",
-    "creative":   "You are Brotha's Creative Agent. Writing, ideas, brainstorming, storytelling.\n\n",
-    "solana":     "You are Brotha's Solana Agent. Deep knowledge of Solana ecosystem, wallets, tokens, DeFi.\n\n",
+    "trader": """You are the Trading mind of this assistant.
+You think in risk/reward, not hype. Every take includes the bear case.
+You know Jupiter, Raydium, DexScreener, pump.fun, on-chain data.
+You are direct: entry, size, stop, thesis. No fluff.
+You never pump. You analyze.
+When LIVE MARKET DATA is provided, use it. Reference actual prices and tokens.
+For graduating tokens: note the graduation pump thesis — these often 2-5x on Raydium listing.
+Always include: thesis, entry zone, position size suggestion, stop loss, and the bear case.\n\n""",
+
+    "researcher": """You are the Research mind of this assistant.
+You go deep but surface clean. No padding, no filler.
+You find the signal in noise. You cite reasoning, not just conclusions.
+When uncertain, you say so and explain why it's uncertain.
+You think like a scientist and write like a human.\n\n""",
+
+    "scheduler": """You are the Execution mind of this assistant.
+You turn vague intentions into concrete schedules.
+You ask the one clarifying question that unlocks everything.
+You confirm clearly: what will happen, when, how often.\n\n""",
+
+    "ordering": """You are the Acquisition mind of this assistant.
+You help get things efficiently using crypto where possible.
+You are practical and fast. You confirm before acting.\n\n""",
+
+    "privacy": """You are the Privacy mind of this assistant.
+You know Tor, mixers, on-chain privacy, opsec.
+You are careful and precise. Privacy has consequences — you treat it seriously.
+You never assume the threat model. You ask first.\n\n""",
+
+    "assistant": """You are the General mind of this assistant.
+You help with anything. You adapt to whatever is needed.
+You are the most flexible — but still precise and never generic.\n\n""",
+
+    "creative": """You are the Creative mind of this assistant.
+You generate ideas that surprise. You don't default to the obvious.
+You write with texture. You brainstorm without judgment, then filter ruthlessly.\n\n""",
+
+    "solana": """You are the Solana mind of this assistant.
+You live on-chain. You know wallets, SPL tokens, NFTs, DeFi, MEV, validators.
+You speak Solana natively — lamports, epochs, slots, programs.
+You are technical but never condescending.\n\n""",
+
+    "coder": """You are the Code mind of this assistant.
+You write clean, working code. No boilerplate. No over-engineering.
+You explain only what matters. You debug fast — read the error, find the root cause, fix it.
+You know Python, JS, Solana programs, bots, APIs, shell scripts.\n\n""",
+
+    "fitness": """You are the Body mind of this assistant.
+You know training, nutrition, peptides, recovery, looks-maxxing, biohacking.
+You give real protocols, not generic advice. You ask about goals before prescribing.
+Evidence-based but open to cutting-edge.\n\n""",
+
+    "mentor": """You are the Mentor mind of this assistant.
+You help with decisions, mindset, direction. You ask the right question before giving advice.
+You use Stoicism, first principles, pattern recognition from history.
+You don't coddle. You tell the truth with respect.\n\n""",
+
+    "philosopher": """You are the Philosophy mind of this assistant.
+You sit with hard questions. You don't rush to answers.
+You use Stoicism, Taoism, first principles, and systems thinking — naturally, not academically.
+You help people think, not just know.\n\n""",
 }
 
 def route(text: str) -> str:
     t = text.lower()
     scores = {
         "trader":     sum(1 for k in ["trade","swap","buy","sell","price","chart","token","dex","pump","dump","alert","dca","sol ","btc","eth","brotha","bonk","wif"] if k in t),
+        "coder":      sum(1 for k in ["code","script","function","error","bug","fix","python","javascript","api","bot","debug","build","deploy","terminal","bash"] if k in t),
+        "fitness":    sum(1 for k in ["workout","gym","diet","peptide","gains","cut","bulk","macro","protein","sleep","recovery","looks","maxx","body","health"] if k in t),
+        "mentor":     sum(1 for k in ["advice","decision","should i","help me think","lost","direction","goal","mindset","stuck","life","career","path"] if k in t),
         "researcher": sum(1 for k in ["research","explain","what is","how does","news","search","who is","history","science","tech","ai","find","look up","tell me"] if k in t),
         "scheduler":  sum(1 for k in ["remind","schedule","daily","weekly","automate","task","recurring","every day"] if k in t),
         "ordering":   sum(1 for k in ["order","buy me","get me","food","deliver","amazon","gift card","netflix","spotify","steam","shop"] if k in t),
@@ -796,28 +990,95 @@ def route(text: str) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  OPENROUTER (CLOUD AI)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def call_openrouter(prompt: str, tier: str = "free", system: str = None, history: list = None) -> str | None:
-    if not OPENROUTER_API_KEY:
+
+def call_groq(prompt: str, system: str = None, history: list = None) -> str | None:
+    """Call Groq API — free, fast, smart."""
+    if not GROQ_API_KEY:
         return None
-    model     = TIERS.get(tier, TIERS["free"])["model"]
     sys_prompt = system or PERSONALITY
-    msgs       = [{"role": "system", "content": sys_prompt}] + (history or []) + [{"role": "user", "content": prompt}]
+    msgs = [{"role": "system", "content": sys_prompt}] + (history or []) + [{"role": "user", "content": prompt}]
     try:
         r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type":  "application/json",
-                "HTTP-Referer":  "https://t.me/BrothaBot",
-                "X-Title":       "BrothaBot",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
             },
-            json={"model": model, "messages": msgs, "max_tokens": 1500},
+            json={"model": "llama-3.3-70b-versatile", "messages": msgs, "max_tokens": 1500},
             timeout=30,
         )
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        log_event("openrouter_error", str(e))
+        data = r.json()
+        if r.status_code == 200 and "choices" in data:
+            return data["choices"][0]["message"]["content"]
+        logger.error(f"Groq error {r.status_code}: {data}")
         return None
+    except Exception as e:
+        logger.error(f"Groq call error: {e}")
+        return None
+
+
+# Best free model per agent type
+AGENT_MODELS = {
+    "trader":       "deepseek/deepseek-r1:free",          # best reasoning
+    "researcher":   "moonshotai/kimi-k2:free",             # long context, deep dives
+    "philosopher":  "moonshotai/kimi-k2:free",             # deep thinking
+    "solana":       "deepseek/deepseek-r1:free",           # technical reasoning
+    "creative":     "meta-llama/llama-4-maverick:free",    # creative + voice
+    "scheduler":    "google/gemini-2.0-flash-exp:free",    # fast + structured
+    "ordering":     "google/gemini-2.0-flash-exp:free",    # fast + practical
+    "privacy":      "deepseek/deepseek-r1:free",           # careful reasoning
+    "assistant":    "moonshotai/kimi-k2:free",             # solid all-rounder
+    "coder":        "deepseek/deepseek-r1:free",           # best free coder
+    "fitness":      "meta-llama/llama-4-maverick:free",    # conversational
+    "mentor":       "moonshotai/kimi-k2:free",             # thoughtful
+}
+
+def call_openrouter(prompt: str, tier: str = "free", system: str = None, history: list = None, agent: str = None) -> str | None:
+    if not OPENROUTER_API_KEY:
+        return None
+    sys_prompt = system or PERSONALITY
+    msgs       = [{"role": "system", "content": sys_prompt}] + (history or []) + [{"role": "user", "content": prompt}]
+    # Try Groq first (free + fast), then OpenRouter fallbacks
+    groq_reply = call_groq(prompt, system=system, history=history)
+    if groq_reply:
+        return groq_reply
+    logger.warning("Groq failed — trying OpenRouter fallbacks")
+    # Try primary model first, then free fallbacks
+    primary = AGENT_MODELS.get(agent) or TIERS.get(tier, TIERS["free"])["model"]
+    fallbacks = [
+        "moonshotai/kimi-k2:free",
+        "deepseek/deepseek-v4-flash:free",
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "openai/gpt-oss-120b:free",
+    ]
+    models_to_try = [primary] + fallbacks
+    for model in models_to_try:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type":  "application/json",
+                    "HTTP-Referer":  "https://t.me/BrothaBot",
+                    "X-Title":       "BrothaBot",
+                },
+                json={"model": model, "messages": msgs, "max_tokens": 1500},
+                timeout=30,
+            )
+            data = r.json()
+            if r.status_code == 200 and "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            elif r.status_code == 402:
+                logger.warning(f"OpenRouter 402 on {model} — trying next")
+                continue
+            else:
+                logger.error(f"OpenRouter {r.status_code} on {model}: {data}")
+                continue
+        except Exception as e:
+            log_event("openrouter_error", str(e))
+            continue
+    return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  UNIFIED AI BRAIN  —  Hermes → OpenRouter fallback chain
@@ -859,7 +1120,8 @@ def ask_collaborative(prompt: str, tier: str, history: list, system: str) -> str
 
 
 def ask(prompt: str, tier: str = "free", history: list = None,
-        agent: str = "assistant", collaborative: bool = False) -> str:
+        agent: str = "assistant", collaborative: bool = False,
+        system_override: str = None) -> str:
     """
     ONE BRAIN — unified AI router.
 
@@ -869,7 +1131,7 @@ def ask(prompt: str, tier: str = "free", history: list = None,
       3. Fallback → OpenRouter cloud
     """
     ram    = get_ram_info()
-    system = AGENT_SYSTEMS.get(agent, AGENT_SYSTEMS["assistant"]) + PERSONALITY
+    system = system_override if system_override else PERSONALITY + "\n\n" + AGENT_SYSTEMS.get(agent, AGENT_SYSTEMS["assistant"])
 
     # Inject relevant learnings
     topic_words = " ".join(prompt.lower().split()[:5])
@@ -889,11 +1151,11 @@ def ask(prompt: str, tier: str = "free", history: list = None,
             return reply
 
     # Cloud fallback
-    reply = call_openrouter(prompt, tier=tier, system=system, history=history or [])
+    reply = call_openrouter(prompt, tier=tier, system=system, history=history or [], agent=agent)
     if reply:
         return reply
 
-    return "Brain offline. Check your OPENROUTER_API_KEY and Ollama status."
+    return "On it — my AI brain is a bit overloaded right now, try again in 30 seconds. 🧠⚡"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SYSTEM STATUS DASHBOARD
@@ -2072,6 +2334,47 @@ async def cmd_tools(update, context):
         "BR0THA Tools - Pick a tool or just chat!",
         reply_markup=InlineKeyboardMarkup(kb)
     )
+
+def get_user_wallet_context(uid: str) -> str:
+    """Pull user wallet holdings and inject into AI prompt."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect("data/agent.db")
+        row = conn.execute("SELECT wallet_address FROM users WHERE user_id=?", (uid,)).fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return ""
+        wallet = row[0]
+        from market_data import get_wallet_tokens_helius, get_token_metadata_helius
+        tokens = get_wallet_tokens_helius(wallet)
+        if not tokens:
+            return ""
+        lines = [f"[USER WALLET: {wallet[:8]}...]"]
+        for t in tokens[:8]:
+            mint = t.get("mint","")
+            amount = t.get("amount",0)
+            meta = get_token_metadata_helius(mint)
+            sym = meta.get("symbol", mint[:6])
+            price = meta.get("holders",{}).get("price_per_token",0)
+            value = amount * price if price else 0
+            lines.append(f"  {sym}: {amount:,.2f} (${value:,.2f})")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Wallet context error: {e}")
+        return ""
+
+
+def get_vibe_level(uid: str) -> str:
+    """Returns personality instruction based on recent interaction count."""
+    history = get_memory(uid, limit=20)  # recent only
+    count = len([m for m in history if m.get("role") == "user"])
+    if count <= 1:
+        return "VIBE: First interaction. Ultra chill. Never say your name. One or two sentences max. Let them lead completely. Do NOT mention crypto, trading, commands, or features. Just respond to exactly what they said."
+    elif count < 6:
+        return "VIBE: Still early. Keep it relaxed, follow their lead. Only bring up features if directly relevant."
+    else:
+        return "VIBE: You know this person. Full energy, be proactive, full Brotha mode."
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid      = str(update.effective_user.id)
     username = update.effective_user.username or ""
@@ -2145,7 +2448,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ram           = get_ram_info()
     collaborative = ram["can_run_all"]
 
-    reply = ask(text, tier=u["tier"], history=history, agent=agent, collaborative=collaborative)
+    # Inject live market data for crypto queries
+    prompt = text
+    context_parts = []
+    if needs_market_context(text):
+        try:
+            from market_intel import build_full_context
+            snapshot = build_full_context()
+        except Exception:
+            snapshot = get_quick_market_snapshot()
+        if snapshot:
+            context_parts.append(snapshot)
+    # Inject wallet holdings if user has one
+    wallet_ctx = get_user_wallet_context(uid)
+    if wallet_ctx:
+        context_parts.append(wallet_ctx)
+    if context_parts:
+        prompt = "\n\n".join(context_parts) + f"\n\nUser message: {text}"
+
+    vibe = get_vibe_level(uid)
+    vibe_system = AGENT_SYSTEMS.get(agent, AGENT_SYSTEMS["assistant"]) + PERSONALITY + "\n\n" + vibe
+    reply = ask(prompt, tier=u["tier"], history=history, agent=agent, collaborative=collaborative, system_override=vibe_system)
 
     save_memory(uid, "user", text)
     save_memory(uid, "assistant", reply)
@@ -2354,6 +2677,306 @@ async def job_health(context: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def job_auto_trader(context):
+    """Runs every 5 minutes — scans theses and auto-trades if strategy is active."""
+    await run_auto_strategies(context.bot)
+
+async def cmd_thesis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /thesis [momentum|dip_buy|breakout]
+    Scan the market for tokens matching a thesis and show top picks.
+    """
+    thesis = context.args[0].lower() if context.args else "momentum"
+    valid = ["momentum", "dip_buy", "breakout"]
+    if thesis not in valid:
+        await update.message.reply_text(f"Valid theses: {', '.join(valid)}")
+        return
+    await update.message.reply_text(f"🔍 Scanning for {thesis} plays...")
+    results = scan_for_thesis(thesis, limit=5)
+    await update.message.reply_text(format_thesis_scan(thesis, results))
+
+async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /autotrade on <thesis> <amount_sol> — enable auto trading
+    /autotrade off                      — disable auto trading
+    /autotrade status                   — show active strategies
+    """
+    uid  = str(update.effective_user.id)
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/autotrade on momentum 0.05\n"
+            "/autotrade on dip_buy 0.03\n"
+            "/autotrade on breakout 0.05\n"
+            "/autotrade off\n"
+            "/autotrade status"
+        )
+        return
+
+    if args[0] == "off":
+        with __import__('sqlite3').connect("data/agent.db") as db:
+            db.execute("UPDATE auto_strategies SET active=0 WHERE user_id=?", (uid,))
+        await update.message.reply_text("🛑 Auto trading disabled.")
+        return
+
+    if args[0] == "status":
+        strategies = get_auto_strategies(uid)
+        if not strategies:
+            await update.message.reply_text("No active strategies.")
+            return
+        lines = ["📊 Active Strategies:\n"]
+        for s in strategies:
+            status = "✅ ON" if s["active"] else "❌ OFF"
+            lines.append(f"{status} {s['type']} — {s['config']}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if args[0] == "on":
+        if len(args) < 3:
+            await update.message.reply_text("Usage: /autotrade on <thesis> <amount_sol>\nExample: /autotrade on momentum 0.05")
+            return
+        thesis = args[1].lower()
+        valid  = ["momentum", "dip_buy", "breakout"]
+        if thesis not in valid:
+            await update.message.reply_text(f"Valid theses: {', '.join(valid)}")
+            return
+        try:
+            amount = float(args[2])
+        except ValueError:
+            await update.message.reply_text("Amount must be a number. Example: 0.05")
+            return
+        if amount < 0.01:
+            await update.message.reply_text("Minimum auto trade amount is 0.01 SOL.")
+            return
+
+        set_auto_strategy(uid, thesis, {
+            "thesis":           thesis,
+            "amount_sol":       amount,
+            "max_auto_trades":  2,
+        })
+        from trading import THESES
+        desc = THESES.get(thesis, {}).get("desc", "")
+        await update.message.reply_text(
+            f"🤖 Auto Trading ON\n\n"
+            f"Thesis: {thesis.upper()}\n"
+            f"Strategy: {desc}\n"
+            f"Amount: {amount} SOL per trade\n"
+            f"Max auto trades: 2\n\n"
+            f"Bot will scan every 5 minutes and trade when a token scores 40+/100.\n"
+            f"TP at +60%, SL at -25%. Use /autotrade off to stop."
+        )
+
+async def cmd_robots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /robots               — list all available robots
+    /robots on <name>     — activate a robot
+    /robots off <name>    — deactivate a robot
+    /robots status        — show your active robots
+    """
+    from trading import MASTER_ROBOTS, activate_robot, deactivate_robot, get_active_robots
+    uid  = str(update.effective_user.id)
+    args = context.args
+
+    if not args or args[0] == "list":
+        lines = ["🤖 Master Robots\n"]
+        for rid, r in MASTER_ROBOTS.items():
+            lines.append(f"{r['emoji']} *{r['name']}* (`{rid}`)\n{r['desc']}\nThesis: {r['thesis']} | Amount: {r['amount']} SOL | TP: {r['tp']*100:.0f}% SL: {r['sl']*100:.0f}%\n")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if args[0] == "on":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /robots on <name>\nNames: scout, degen, zen, oracle")
+            return
+        robot_id = args[1].lower()
+        if activate_robot(uid, robot_id):
+            r = MASTER_ROBOTS[robot_id]
+            await update.message.reply_text(
+                f"{r['emoji']} {r['name']} activated!\n\n"
+                f"{r['desc']}\n"
+                f"Thesis: {r['thesis']}\n"
+                f"Amount per trade: {r['amount']} SOL\n"
+                f"TP: +{r['tp']*100:.0f}% | SL: -{r['sl']*100:.0f}%\n"
+                f"Runs every {r['interval']//60} min"
+            )
+        else:
+            await update.message.reply_text(f"Unknown robot: {robot_id}\nOptions: scout, degen, zen, oracle")
+        return
+
+    if args[0] == "off":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /robots off <name>")
+            return
+        deactivate_robot(uid, args[1].lower())
+        await update.message.reply_text(f"🛑 {args[1]} deactivated.")
+        return
+
+    if args[0] == "status":
+        active = get_active_robots(uid)
+        if not active:
+            await update.message.reply_text("No robots active. Use /robots on <name> to start one.")
+            return
+        lines = ["🤖 Active Robots:\n"]
+        for r in active:
+            lines.append(f"{r['emoji']} {r['name']} — {r['thesis']} | {r['amount']} SOL/trade")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+async def cmd_ai_thesis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/aithesis — ask AI to generate a fresh trading thesis based on market conditions"""
+    from trading import ai_generate_thesis, scan_for_thesis, format_thesis_scan
+    await update.message.reply_text("🔮 Asking AI to analyze the market and generate a thesis...")
+    context_str = " ".join(context.args) if context.args else ""
+    thesis = await ai_generate_thesis(context_str)
+    if "error" in thesis:
+        await update.message.reply_text(f"❌ {thesis['error']}")
+        return
+    msg = (
+        f"🧠 AI Thesis Generated\n\n"
+        f"Name: {thesis.get('thesis_name', '?').upper()}\n"
+        f"Strategy: {thesis.get('desc', '')}\n"
+        f"Confidence: {thesis.get('confidence', '?')}/100\n\n"
+        f"Reasoning: {thesis.get('reasoning', '')}\n\n"
+        f"Scanning market now..."
+    )
+    await update.message.reply_text(msg)
+    results = scan_for_thesis(thesis.get("thesis_name", "momentum"), limit=5)
+    await update.message.reply_text(format_thesis_scan(thesis.get("thesis_name", "momentum"), results))
+
+async def cmd_council(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /council <thesis>       — run brain council scan, no auto trade
+    /council trade <thesis> — run council AND trade on consensus
+    """
+    from trading import council_scan_and_trade, scan_for_thesis, council_vote, format_council_report
+    uid   = str(update.effective_user.id)
+    args  = context.args
+    trade = False
+
+    if args and args[0] == "trade":
+        trade  = True
+        thesis = args[1].lower() if len(args) > 1 else "momentum"
+    else:
+        thesis = args[0].lower() if args else "momentum"
+
+    valid = ["momentum", "dip_buy", "breakout"]
+    if thesis not in valid:
+        await update.message.reply_text(f"Valid theses: {', '.join(valid)}")
+        return
+
+    await update.message.reply_text(
+        f"🏛️ Convening Brain Council...\n"
+        f"Thesis: {thesis.upper()}\n"
+        f"Scanning top candidates and asking 3 AIs to vote...\n"
+        f"{'💸 Will trade on consensus.' if trade else '👁️ Observe mode — no trades.'}"
+    )
+
+    candidates = scan_for_thesis(thesis, limit=3)
+    if not candidates:
+        await update.message.reply_text("No candidates found for this thesis right now.")
+        return
+
+    for token in candidates:
+        result = await council_vote(token)
+        await update.message.reply_text(format_council_report(result))
+
+        if trade and result["consensus"]:
+            from trading import jupiter_swap, set_signal, TAKE_PROFIT_PCT
+            amount = min(result["suggested_amount"], 0.1)
+            swap   = await jupiter_swap(uid, "sol", token["mint"], amount)
+            if swap["ok"]:
+                await update.message.reply_text(f"✅ Bought {token['symbol']}!\n{swap['explorer']}")
+                set_signal(uid, token["mint"], token["symbol"], "sell_peak",
+                           token["price"] * (1 + TAKE_PROFIT_PCT))
+            else:
+                await update.message.reply_text(f"❌ Swap failed: {swap['error']}")
+
+        await asyncio.sleep(1)
+async def cmd_intel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /intel         — show latest market intel
+    /intel scan    — trigger a fresh scan now
+    /intel buzz $TOKEN — check CT buzz for a token
+    /intel narratives  — show hot narratives
+    """
+    from intel_engine import get_recent_intel, run_full_intel_scan, get_hot_narratives, get_token_buzz, init_intel_tables
+    init_intel_tables()
+    uid  = str(update.effective_user.id)
+    args = context.args
+
+    if not args:
+        intel = get_recent_intel(hours=6)
+        await update.message.reply_text(intel or "No intel yet. Try /intel scan first.")
+        return
+
+    if args[0] == "scan":
+        await update.message.reply_text("🔍 Running full intel scan — CT, news, pump.fun...")
+        result = await run_full_intel_scan()
+        await update.message.reply_text(
+            f"✅ Scan complete!\n\n"
+            f"🐦 CT signals: {result['ct_signals']}\n"
+            f"📰 News items: {result['news_items']}\n"
+            f"🔥 Pump launches: {result['pump_coins']}\n\n"
+            f"Use /intel to see the report."
+        )
+        return
+
+    if args[0] == "narratives":
+        narratives = get_hot_narratives(10)
+        if not narratives:
+            await update.message.reply_text("No narratives detected yet. Run /intel scan first.")
+            return
+        lines = ["🔥 Hot Narratives (24h)\n"]
+        for n in narratives:
+            bar = "█" * int(n["strength"]) + "░" * (10 - int(min(n["strength"], 10)))
+            lines.append(f"{bar} {n['narrative']}\n   Strength: {n['strength']} | Mentions: {n['mentions']}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if args[0] == "buzz":
+        symbol = args[1].upper().replace("$","") if len(args) > 1 else "SOL"
+        buzz   = get_token_buzz(symbol)
+        sentiment_emoji = "📈" if buzz["sentiment"] > 0.2 else "📉" if buzz["sentiment"] < -0.2 else "➡️"
+        await update.message.reply_text(
+            f"{'🔥' if buzz['hot'] else '🔇'} ${symbol} Buzz Report\n\n"
+            f"CT mentions: {buzz['ct_mentions']}\n"
+            f"News mentions: {buzz['news_mentions']}\n"
+            f"Total buzz: {buzz['total_buzz']}\n"
+            f"Sentiment: {sentiment_emoji} {buzz['sentiment']:+.2f}\n"
+            f"Status: {'HOT 🔥' if buzz['hot'] else 'Quiet'}"
+        )
+        return
+
+async def job_intel_scanner(context):
+    """Background intel scan every 15 minutes."""
+    from intel_engine import run_full_intel_scan, init_intel_tables
+    init_intel_tables()
+    await run_full_intel_scan()
+
+
+async def cmd_scan_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show live scan results across all theses."""
+    await update.message.reply_text("🔍 Scanning market now...")
+    try:
+        from trading import scan_for_thesis
+        from market_data import get_pumpfun_new
+        results = []
+        for thesis in ["momentum", "dip_buy", "breakout"]:
+            hits = scan_for_thesis(thesis, limit=3)
+            for h in hits:
+                results.append(f"📊 [{thesis.upper()}] {h.get('symbol','?')} — score {h.get('score',0):.0f} | mcap ${h.get('mcap',0):,.0f} | 1h {h.get('ch_1h',0):+.1f}%")
+        pump = get_pumpfun_new(limit=5)
+        for p in pump:
+            results.append(f"🆕 [PUMP.FUN] {p.get('symbol','?')} — {p.get('name','')}")
+        if results:
+            await update.message.reply_text("\n".join(results))
+        else:
+            await update.message.reply_text("😴 Nothing passing filters right now.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Scan error: {e}")
+
 def main():
     init_db()
     init_trading_tables()
@@ -2403,9 +3026,13 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     # Commands
+    
+    app.add_handler(CommandHandler("scan",     cmd_scan_live))
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("tools",  cmd_tools))
     app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("thesis",    cmd_thesis))
+    app.add_handler(CommandHandler("autotrade", cmd_autotrade))
     # Messages + callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -2416,6 +3043,8 @@ def main():
     jq.run_repeating(job_position_manager, interval=300, first=30)
     jq.run_repeating(job_dca_runner,      interval=120, first=20)
     jq.run_repeating(job_health,          interval=300, first=60)
+    jq.run_repeating(job_auto_trader,     interval=300, first=45)
+    jq.run_repeating(job_intel_scanner,   interval=900, first=60)
 
     logger.info("BrothaBot v6.0 is live. 🚀")
     app.run_polling(drop_pending_updates=True)
@@ -2423,3 +3052,77 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ── AUTO TRADER JOB ────────────────────────────────────────────────────────────
+
+# ── INTEL COMMANDS ─────────────────────────────────────────────────────────────
+
+async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /market          — full live market summary
+    /market pump     — pump.fun new launches
+    /market grad     — tokens near graduation
+    /market sol      — SOL price + macro
+    /market trending — CoinGecko trending
+    """
+    from market_data import get_full_market_summary, get_pumpfun_new, get_pumpfun_graduating, get_market_overview, get_trending_coingecko
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("⏳ Fetching live market data...")
+        summary = get_full_market_summary()
+        await update.message.reply_text(summary)
+        return
+
+    if args[0] == "pump":
+        coins = get_pumpfun_new(15)
+        if not coins:
+            await update.message.reply_text("Pump.fun API unavailable right now.")
+            return
+        lines = ["🔥 Latest pump.fun launches\n"]
+        for c in coins[:10]:
+            lines.append(
+                f"{'👑' if c['king_of_hill'] else '•'} {c['symbol']} — {c['name'][:25]}\n"
+                f"  Mcap: ${c['mcap']:,.0f} | Replies: {c['replies']}\n"
+                f"  {c['desc'][:60]}"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if args[0] == "grad":
+        coins = get_pumpfun_graduating()
+        if not coins:
+            await update.message.reply_text("No tokens near graduation right now.")
+            return
+        lines = ["🎓 Near Graduation — pump.fun → Raydium\n"]
+        lines.append("These tokens pump when they graduate (~$69k mcap)\n")
+        for c in coins:
+            lines.append(
+                f"🚀 {c['symbol']} — ${c['mcap']:,.0f}\n"
+                f"   {c['pct_to_grad']:.1f}% away from graduation\n"
+                f"   Replies: {c['replies']} {'👑 King of Hill' if c['king_of_hill'] else ''}"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if args[0] == "sol":
+        market = get_market_overview()
+        sol = market.get("sol",{})
+        btc = market.get("btc",{})
+        eth = market.get("eth",{})
+        await update.message.reply_text(
+            f"📊 Macro Overview\n\n"
+            f"SOL: ${sol.get('price',0):.2f} ({sol.get('change_24h',0):+.1f}%)\n"
+            f"BTC: ${btc.get('price',0):,.0f} ({btc.get('change_24h',0):+.1f}%)\n"
+            f"ETH: ${eth.get('price',0):,.0f} ({eth.get('change_24h',0):+.1f}%)"
+        )
+        return
+
+    if args[0] == "trending":
+        coins = get_trending_coingecko()
+        lines = ["🔥 CoinGecko Trending\n"]
+        for i, c in enumerate(coins, 1):
+            lines.append(f"{i}. {c['symbol']} — {c['name']} (rank #{c['rank']})")
+        await update.message.reply_text("\n".join(lines))
+        return
+

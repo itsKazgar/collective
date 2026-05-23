@@ -78,14 +78,14 @@ def ask_cerebras_small(prompt, system):
 # Groq large + Groq small + Groq mixtral + Cerebras large + Cerebras small
 
 AGENT_ROUTES = {
-    "orchestrator": ask_cerebras,        # cerebras
-    "intel":        ask_groq_small,       # groq small
-    "analyst":      ask_groq_versatile,  # groq qwen
-    "trader":       ask_cerebras_small,  # cerebras small
-    "risk":         ask_cerebras,        # cerebras
-    "income":       ask_groq_small,      # groq small
-    "onchain":      ask_groq_small,      # groq small
-    "security":     ask_cerebras,        # cerebras
+    "orchestrator": ask_groq_large,       # final decision — best model
+    "intel":        ask_cerebras,         # narrative — cerebras fast
+    "analyst":      ask_groq_versatile,   # quant — qwen3-32b — mixtral good at math
+    "trader":       ask_cerebras_small,   # execution — fast enough
+    "risk":         ask_groq_large,       # risk — needs best reasoning
+    "income":       ask_groq_small,       # yield — small is fine
+    "onchain":      ask_cerebras,         # on-chain — cerebras fast
+    "security":     ask_groq_small,       # rug detection — small ok
 }
 
 FALLBACKS = [ask_groq_large, ask_cerebras, ask_groq_small, ask_groq_versatile]

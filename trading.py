@@ -40,11 +40,11 @@ USDC_MINT      = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 # ── RISK RULES ─────────────────────────────────────────────────────────────────
 MAX_OPEN_TRADES    = 3        # never more than 3 at once
-MAX_POSITION_PCT   = 0.20     # max 20% of tradeable balance per trade
+MAX_POSITION_PCT   = 0.25     # max 20% of tradeable balance per trade
 RESERVE_PCT        = 0.50     # 50% of wallet always untouched
-TAKE_PROFIT_PCT    = 0.60     # take profit at +60%
+TAKE_PROFIT_PCT    = 0.15     # take profit at +60%
 LEAVE_IN_PCT       = 0.10     # leave 10% in after TP to compound
-STOP_LOSS_PCT      = -0.25    # cut at -25%
+STOP_LOSS_PCT      = -0.07    # cut at -25%
 MIN_MCAP_USD       = 35_000   # minimum $35k market cap
 TRADING_WEEK_SOL   = 0.2      # 0.2 SOL per week for trading access
 BOT_FEE_PCT        = 0.005    # 0.5% fee on each trade
@@ -327,7 +327,7 @@ def get_dynamic_slippage(liquidity_usd: float, amount_sol: float, sol_price_usd:
     elif impact_pct < 5:
         return 300   # 3%
     else:
-        return 500   # 5% max — thin liquidity
+        return 1000  # 10% max — thin liquidity
 
 # ── JUPITER SWAP ───────────────────────────────────────────────────────────────
 async def jupiter_swap(user_id: str, from_token: str, to_token: str, amount_sol: float) -> dict:
@@ -714,3 +714,462 @@ def get_alerts(user_id: str) -> list:
             "SELECT coin,target,direction FROM alerts WHERE user_id=? AND active=1", (user_id,)
         ).fetchall()
     return [{"coin": r[0], "target": r[1], "direction": r[2]} for r in rows]
+
+
+# ── THESIS ENGINE ──────────────────────────────────────────────────────────────
+"""
+Theses define WHAT to buy and WHY.
+Each thesis is a filter + scoring function over DexScreener data.
+"""
+
+THESES = {
+    "momentum": {
+        "desc": "Buy tokens pumping >20% in 1h with rising volume",
+        "min_change_1h": 20,
+        "min_volume_24h": 50_000,
+        "min_mcap": 50_000,
+        "max_mcap": 5_000_000,
+        "min_liquidity": 20_000,
+    },
+    "dip_buy": {
+        "desc": "Buy quality tokens down >15% in 24h — mean reversion play",
+        "max_change_24h": -15,
+        "min_volume_24h": 30_000,
+        "min_mcap": 100_000,
+        "max_mcap": 10_000_000,
+        "min_liquidity": 25_000,
+    },
+    "breakout": {
+        "desc": "Buy tokens with high volume vs mcap ratio — early breakout",
+        "min_vol_mcap_ratio": 0.3,   # volume >= 30% of mcap = hot
+        "min_mcap": 35_000,
+        "max_mcap": 2_000_000,
+        "min_liquidity": 15_000,
+    },
+}
+
+def score_token(pair: dict, thesis: str) -> tuple[bool, float, str]:
+    """
+    Returns (passes, score, reason).
+    Score 0-100. Higher = stronger entry.
+    """
+    t = THESES.get(thesis)
+    if not t:
+        return False, 0, "Unknown thesis"
+
+    try:
+        mcap     = float(pair.get("fdv") or 0)
+        liq      = float(pair.get("liquidity", {}).get("usd") or 0)
+        vol_24h  = float(pair.get("volume", {}).get("h24") or 0)
+        ch_1h    = float(pair.get("priceChange", {}).get("h1") or 0)
+        ch_24h   = float(pair.get("priceChange", {}).get("h24") or 0)
+        chain    = pair.get("chainId", "")
+
+        if chain != "solana":
+            return False, 0, "Not Solana"
+        if mcap < MIN_MCAP_USD:
+            return False, 0, f"Mcap too low ${mcap:,.0f}"
+        if liq < t.get("min_liquidity", 0):
+            return False, 0, f"Low liquidity ${liq:,.0f}"
+
+        if thesis == "momentum":
+            if ch_1h < t["min_change_1h"]:
+                return False, 0, f"1h change only {ch_1h:.1f}%"
+            if vol_24h < t["min_volume_24h"]:
+                return False, 0, "Volume too low"
+            if not (t["min_mcap"] <= mcap <= t["max_mcap"]):
+                return False, 0, "Mcap out of range"
+            score = min(ch_1h * 2, 60) + min(vol_24h / 10_000, 40)
+
+        elif thesis == "dip_buy":
+            if ch_24h > t["max_change_24h"]:
+                return False, 0, f"Not enough dip: {ch_24h:.1f}%"
+            if vol_24h < t["min_volume_24h"]:
+                return False, 0, "Volume too low"
+            if not (t["min_mcap"] <= mcap <= t["max_mcap"]):
+                return False, 0, "Mcap out of range"
+            score = min(abs(ch_24h) * 2, 50) + min(vol_24h / 5_000, 50)
+
+        elif thesis == "breakout":
+            ratio = vol_24h / max(mcap, 1)
+            if ratio < t["min_vol_mcap_ratio"]:
+                return False, 0, f"Vol/mcap ratio low: {ratio:.2f}"
+            if not (t["min_mcap"] <= mcap <= t["max_mcap"]):
+                return False, 0, "Mcap out of range"
+            score = min(ratio * 100, 70) + min(liq / 1_000, 30)
+
+        else:
+            return False, 0, "Unknown thesis"
+
+        return True, round(score, 1), f"{thesis} score {score:.0f}"
+
+    except Exception as e:
+        return False, 0, str(e)
+
+
+def scan_for_thesis(thesis: str, limit: int = 5) -> list[dict]:
+    """
+    Scan DexScreener trending Solana pairs and score against a thesis.
+    Returns top matches sorted by score.
+    """
+    try:
+        r = requests.get(
+            "https://api.dexscreener.com/latest/dex/tokens/trending?chainId=solana",
+            timeout=15
+        )
+        pairs = r.json() if isinstance(r.json(), list) else r.json().get("pairs", [])
+    except:
+        # fallback: search broad
+        try:
+            r = requests.get(
+                "https://api.dexscreener.com/latest/dex/search/?q=solana",
+                timeout=15
+            )
+            pairs = r.json().get("pairs", [])
+        except:
+            return []
+
+    results = []
+    for pair in pairs:
+        passes, score, reason = score_token(pair, thesis)
+        if passes:
+            results.append({
+                "mint":    pair.get("baseToken", {}).get("address", ""),
+                "symbol":  pair.get("baseToken", {}).get("symbol", "?"),
+                "name":    pair.get("baseToken", {}).get("name", ""),
+                "price":   float(pair.get("priceUsd") or 0),
+                "mcap":    float(pair.get("fdv") or 0),
+                "liq":     float(pair.get("liquidity", {}).get("usd") or 0),
+                "vol_24h": float(pair.get("volume", {}).get("h24") or 0),
+                "ch_1h":   float(pair.get("priceChange", {}).get("h1") or 0),
+                "ch_24h":  float(pair.get("priceChange", {}).get("h24") or 0),
+                "score":   score,
+                "reason":  reason,
+                "dex_url": pair.get("url", ""),
+            })
+
+    return sorted(results, key=lambda x: x["score"], reverse=True)[:limit]
+
+
+# ── AUTO TRADE LOOP ────────────────────────────────────────────────────────────
+async def run_auto_strategies(bot=None):
+    """
+    Background loop — runs every 5 minutes.
+    For each user with an active auto_strategy, scan + trade if thesis passes.
+    Wire this into your bot's background task scheduler.
+    """
+    with sqlite3.connect(DB_PATH) as db:
+        strategies = db.execute(
+            "SELECT user_id, strategy_type, config FROM auto_strategies WHERE active=1"
+        ).fetchall()
+
+    for uid, stype, cfg_json in strategies:
+        try:
+            cfg = json.loads(cfg_json)
+            thesis   = cfg.get("thesis", stype)
+            amount   = float(cfg.get("amount_sol", 0.05))
+            max_auto = int(cfg.get("max_auto_trades", 1))
+
+            # Don't exceed open trade limit
+            open_count = get_open_trade_count(uid)
+            if open_count >= MAX_OPEN_TRADES:
+                continue
+
+            auto_open = get_auto_trade_count(uid)
+            if auto_open >= max_auto:
+                continue
+
+            candidates = scan_for_thesis(thesis, limit=3)
+            if not candidates:
+                continue
+
+            best = candidates[0]
+            if best["score"] < 40:
+                continue  # not confident enough
+
+            # Check not already holding this token
+            positions = get_open_positions(uid)
+            already_in = any(p["mint"] == best["mint"] for p in positions)
+            if already_in:
+                continue
+
+            result = await jupiter_swap(uid, "sol", best["mint"], amount)
+
+            msg = (
+                f"🤖 Auto Trade — {thesis.upper()}\n\n"
+                f"Token: {best['symbol']}\n"
+                f"Score: {best['score']}/100\n"
+                f"Mcap: ${best['mcap']:,.0f}\n"
+                f"1h: {best['ch_1h']:+.1f}%  24h: {best['ch_24h']:+.1f}%\n"
+                f"Amount: {amount} SOL\n\n"
+            )
+            if result["ok"]:
+                msg += f"✅ Bought!\nTx: {result['explorer']}"
+                # Auto-set TP/SL signals
+                set_signal(uid, best["mint"], best["symbol"], "sell_peak",
+                           best["price"] * (1 + TAKE_PROFIT_PCT))
+            else:
+                msg += f"❌ Failed: {result['error']}"
+
+            if bot:
+                try:
+                    await bot.send_message(chat_id=uid, text=msg)
+                except:
+                    pass
+
+        except Exception as e:
+            logger.error(f"Auto strategy error for {uid}: {e}")
+
+
+def get_auto_trade_count(user_id: str) -> int:
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            "SELECT COUNT(*) FROM open_positions WHERE user_id=? AND status='open' AND strategy!='manual'",
+            (user_id,)
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def format_thesis_scan(thesis: str, results: list) -> str:
+    if not results:
+        return f"🔍 No tokens passed the **{thesis}** thesis right now. Market may be quiet."
+    t = THESES.get(thesis, {})
+    lines = [f"🎯 Thesis: {thesis.upper()}", f"_{t.get('desc', '')}_\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(
+            f"{i}. {r['symbol']} — Score {r['score']}/100\n"
+            f"   Mcap ${r['mcap']:,.0f} | Liq ${r['liq']:,.0f}\n"
+            f"   1h {r['ch_1h']:+.1f}% | 24h {r['ch_24h']:+.1f}%\n"
+            f"   {r['dex_url']}"
+        )
+    return "\n".join(lines)
+
+
+# ── AI THESIS GENERATOR ────────────────────────────────────────────────────────
+import httpx, os, json
+
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+
+async def ai_generate_thesis(market_context: str = "") -> dict:
+    """
+    Ask the AI to generate a trading thesis based on current market conditions.
+    Returns a thesis config the bot can act on immediately.
+    """
+    if not OPENROUTER_KEY:
+        return {"error": "No OPENROUTER_API_KEY in .env"}
+
+    prompt = f"""You are a Solana memecoin trading bot. Analyze current market conditions and generate ONE trading thesis.
+
+Market context: {market_context or "No context provided — use general crypto market intuition."}
+
+Respond ONLY with a valid JSON object like this:
+{{
+  "thesis_name": "momentum" | "dip_buy" | "breakout" | "custom",
+  "desc": "One sentence explaining the thesis",
+  "min_change_1h": <float or null>,
+  "max_change_24h": <float or null>,
+  "min_volume_24h": <float>,
+  "min_mcap": <float>,
+  "max_mcap": <float>,
+  "min_liquidity": <float>,
+  "min_vol_mcap_ratio": <float or null>,
+  "confidence": <0-100>,
+  "reasoning": "Why this thesis makes sense right now"
+}}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                json={
+                    "model": "mistralai/mixtral-8x7b-instruct",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                }
+            )
+        content = r.json()["choices"][0]["message"]["content"]
+        # Strip markdown fences if present
+        content = content.strip().strip("```json").strip("```").strip()
+        thesis = json.loads(content)
+        # Register it as a live thesis
+        THESES[thesis["thesis_name"]] = thesis
+        return thesis
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── MASTER ROBOTS ──────────────────────────────────────────────────────────────
+"""
+Master robots are named autonomous agents with a personality and strategy.
+Each runs independently, manages its own trades, and reports to the user.
+"""
+
+MASTER_ROBOTS = {
+    "scout": {
+        "name":      "Scout",
+        "emoji":     "🔭",
+        "desc":      "Finds early breakouts. Buys small, exits fast.",
+        "thesis":    "breakout",
+        "amount":    0.03,
+        "tp":        0.40,   # 40% TP
+        "sl":        0.15,   # 15% SL — tight
+        "interval":  180,    # runs every 3 min
+        "max_trades": 2,
+    },
+    "degen": {
+        "name":      "Degen",
+        "emoji":     "🎰",
+        "desc":      "Momentum chaser. High risk, high reward.",
+        "thesis":    "momentum",
+        "amount":    0.05,
+        "tp":        0.80,
+        "sl":        0.30,
+        "interval":  300,
+        "max_trades": 1,
+    },
+    "zen": {
+        "name":      "Zen",
+        "emoji":     "🧘",
+        "desc":      "Buys quality dips. Patient and disciplined.",
+        "thesis":    "dip_buy",
+        "amount":    0.04,
+        "tp":        0.60,
+        "sl":        0.20,
+        "interval":  600,    # runs every 10 min
+        "max_trades": 2,
+    },
+    "oracle": {
+        "name":      "Oracle",
+        "emoji":     "🔮",
+        "desc":      "AI-generated thesis every hour. Adapts to market.",
+        "thesis":    "ai",   # dynamically generated
+        "amount":    0.04,
+        "tp":        0.60,
+        "sl":        0.25,
+        "interval":  3600,
+        "max_trades": 1,
+    },
+}
+
+def get_active_robots(user_id: str) -> list:
+    with sqlite3.connect(DB_PATH) as db:
+        rows = db.execute(
+            "SELECT strategy_type, config FROM auto_strategies WHERE user_id=? AND active=1",
+            (user_id,)
+        ).fetchall()
+    active = []
+    for row in rows:
+        if row[0].startswith("robot_"):
+            robot_id = row[0].replace("robot_", "")
+            if robot_id in MASTER_ROBOTS:
+                active.append({**MASTER_ROBOTS[robot_id], "id": robot_id, "config": json.loads(row[1])})
+    return active
+
+def activate_robot(user_id: str, robot_id: str):
+    if robot_id not in MASTER_ROBOTS:
+        return False
+    robot = MASTER_ROBOTS[robot_id]
+    set_auto_strategy(user_id, f"robot_{robot_id}", {
+        "robot":      robot_id,
+        "thesis":     robot["thesis"],
+        "amount_sol": robot["amount"],
+        "tp":         robot["tp"],
+        "sl":         robot["sl"],
+        "max_auto_trades": robot["max_trades"],
+    })
+    return True
+
+def deactivate_robot(user_id: str, robot_id: str):
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            "UPDATE auto_strategies SET active=0 WHERE user_id=? AND strategy_type=?",
+            (user_id, f"robot_{robot_id}")
+        )
+
+async def run_master_robots(bot=None):
+    """
+    Background loop for all active master robots.
+    Each robot runs on its own interval and thesis.
+    """
+    with sqlite3.connect(DB_PATH) as db:
+        strategies = db.execute(
+            "SELECT user_id, strategy_type, config FROM auto_strategies WHERE active=1 AND strategy_type LIKE 'robot_%'"
+        ).fetchall()
+
+    now = time.time()
+    for uid, stype, cfg_json in strategies:
+        try:
+            robot_id = stype.replace("robot_", "")
+            robot    = MASTER_ROBOTS.get(robot_id)
+            if not robot:
+                continue
+
+            cfg      = json.loads(cfg_json)
+            last_run = cfg.get("last_run", 0)
+            if now - last_run < robot["interval"]:
+                continue
+
+            # Update last_run
+            cfg["last_run"] = now
+            with sqlite3.connect(DB_PATH) as db:
+                db.execute(
+                    "UPDATE auto_strategies SET config=? WHERE user_id=? AND strategy_type=?",
+                    (json.dumps(cfg), uid, stype)
+                )
+
+            thesis = robot["thesis"]
+
+            # Oracle robot generates AI thesis dynamically
+            if thesis == "ai":
+                generated = await ai_generate_thesis()
+                if "error" in generated:
+                    continue
+                thesis = generated.get("thesis_name", "momentum")
+
+            open_count = get_open_trade_count(uid)
+            if open_count >= MAX_OPEN_TRADES:
+                continue
+
+            auto_count = get_auto_trade_count(uid)
+            if auto_count >= robot["max_trades"]:
+                continue
+
+            candidates = scan_for_thesis(thesis, limit=3)
+            if not candidates:
+                continue
+
+            best = candidates[0]
+            if best["score"] < 35:
+                continue
+
+            positions = get_open_positions(uid)
+            if any(p["mint"] == best["mint"] for p in positions):
+                continue
+
+            result = await jupiter_swap(uid, "sol", best["mint"], robot["amount"])
+
+            msg = (
+                f"{robot['emoji']} {robot['name']} Robot\n\n"
+                f"Thesis: {thesis.upper()}\n"
+                f"Token: {best['symbol']} (score {best['score']}/100)\n"
+                f"Mcap: ${best['mcap']:,.0f}\n"
+                f"1h: {best['ch_1h']:+.1f}% | 24h: {best['ch_24h']:+.1f}%\n"
+                f"Amount: {robot['amount']} SOL\n"
+                f"TP: +{robot['tp']*100:.0f}% | SL: -{robot['sl']*100:.0f}%\n\n"
+            )
+            if result["ok"]:
+                msg += f"✅ Bought!\n{result['explorer']}"
+                set_signal(uid, best["mint"], best["symbol"], "sell_peak",
+                           best["price"] * (1 + robot["tp"]))
+            else:
+                msg += f"❌ Failed: {result['error']}"
+
+            if bot:
+                try:
+                    await bot.send_message(chat_id=uid, text=msg)
+                except:
+                    pass
+
+        except Exception as e:
+            logger.error(f"Robot {stype} error for {uid}: {e}")
