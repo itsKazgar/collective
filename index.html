@@ -347,7 +347,7 @@ input:checked+.tsl:before{transform:translateX(17px);background:var(--green)}
 
     <!-- OVERVIEW -->
     <div class="panel on" id="p-overview">
-      <div class="cmd-line"><span class="p">user@console:~$ </span><span class="c">systemctl status brotha-bot && ./status.sh</span></div>
+      <div class="cmd-line"><span class="p">user@console:~$ </span><span class="c">systemctl status collective && ./status.sh</span></div>
 
       <div class="irow" style="margin-bottom:14px">
         <span class="pre">endpoint →</span>
@@ -388,7 +388,7 @@ input:checked+.tsl:before{transform:translateX(17px);background:var(--green)}
           <div class="step-n">1</div>
           <div class="step-body">
             <div class="step-title">Push your bot to GitHub</div>
-            <div class="step-desc">Put these files in a GitHub repo: brotha_api.py, ai_router.py, trading.py, auth.py, requirements.txt</div>
+            <div class="step-desc">Put these files in a GitHub repo: api.py, ai_router.py, trading.py, auth.py, requirements.txt</div>
             <div class="code-block">pip freeze > requirements.txt
 git init && git add . && git commit -m "initial commit"
 gh repo create trading-bot --public --push</div>
@@ -424,7 +424,7 @@ WALLET_PRIVATE_KEY_B58=...</div>
           <div class="step-body">
             <div class="step-title">Set the start command</div>
             <div class="step-desc">In Railway → Settings → Start Command:</div>
-            <div class="code-block">uvicorn brotha_api:app --host 0.0.0.0 --port $PORT</div>
+            <div class="code-block">uvicorn api:app --host 0.0.0.0 --port $PORT</div>
           </div>
         </div>
 
@@ -452,7 +452,7 @@ WALLET_PRIVATE_KEY_B58=...</div>
           <div class="step-body">
             <div class="step-title">Build & Start commands</div>
             <div class="code-block">Build: pip install -r requirements.txt
-Start: uvicorn brotha_api:app --host 0.0.0.0 --port $PORT</div>
+Start: uvicorn api:app --host 0.0.0.0 --port $PORT</div>
             <div class="step-desc" style="margin-top:4px">Add env vars in the Environment tab. Free tier sleeps after 15min inactivity — use Railway if you want it always-on.</div>
           </div>
         </div>
@@ -466,7 +466,7 @@ Start: uvicorn brotha_api:app --host 0.0.0.0 --port $PORT</div>
             <div class="step-title">Run on your laptop, share via ngrok</div>
             <div class="code-block">cd ~/trading-bot
 source venv/bin/activate
-uvicorn brotha_api:app --host 0.0.0.0 --port 8000
+uvicorn api:app --host 0.0.0.0 --port 8000
 
 # in another terminal:
 ngrok http 8000</div>
@@ -691,7 +691,7 @@ ngrok http 8000</div>
 
     <!-- LOGS -->
     <div class="panel" id="p-logs">
-      <div class="cmd-line"><span class="p">user@console:~$ </span><span class="c">tail -f brotha.log | grep -E "INFO|ERR|WARN"</span></div>
+      <div class="cmd-line"><span class="p">user@console:~$ </span><span class="c">tail -f collective.log | grep -E "INFO|ERR|WARN"</span></div>
       <div style="display:flex;gap:6px;margin-bottom:10px">
         <button class="btn" onclick="clearLogs()">clear</button>
         <button class="btn g" onclick="pollLogs()">↺ refresh</button>
@@ -835,7 +835,7 @@ async function connectBot() {
     setConnected(false);
     document.getElementById('s-state').textContent = 'offline';
     document.getElementById('s-state').className = 'stat-v r';
-    document.getElementById('status-out').innerHTML = '<span class="e">× cannot connect to ' + url + '</span>\n<span class="m">check: uvicorn brotha_api:app --host 0.0.0.0 --port 8000\nor see 🚀 free deploy tab</span>';
+    document.getElementById('status-out').innerHTML = '<span class="e">× cannot connect to ' + url + '</span>\n<span class="m">check: uvicorn api:app --host 0.0.0.0 --port 8000\nor see 🚀 free deploy tab</span>';
     toast('connection failed — see free deploy tab', true);
   }
 }
