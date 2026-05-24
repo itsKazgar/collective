@@ -1,7 +1,7 @@
-# BR0THA Bot 🤖
+# Collective 🤖
 > Solana AI trading dashboard powered by a multi-model agent council
 
-**🔴 Live Demo:** https://itskazgar.github.io/BR0THA_bot
+**🔴 Live Demo:** https://itskazgar.github.io/collective
 
 A modular AI trading system where multiple AI models (Claude, GPT-4o, Grok, Gemini, Groq) vote on trades together. The council reaches consensus before any swap executes.
 
@@ -23,8 +23,8 @@ A modular AI trading system where multiple AI models (Claude, GPT-4o, Grok, Gemi
 
 ## Run locally
 ```bash
-git clone https://github.com/itsKazgar/BR0THA_bot
-cd BR0THA_bot
+git clone https://github.com/itsKazgar/collective
+cd collective
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 uvicorn brotha_api:app --host 0.0.0.0 --port 8000
