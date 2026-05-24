@@ -17,7 +17,7 @@ A modular AI trading system where multiple AI models (Claude, GPT-4o, Grok, Gemi
 | Layer | Tech |
 |-------|------|
 | Dashboard | HTML/JS — deploy to Netlify |
-| API | FastAPI (brotha_api.py) — deploy to Render/Railway |
+| API | FastAPI (api.py) — deploy to Render/Railway |
 | AI Providers | Claude, GPT-4o, Grok, Gemini, Groq, OpenRouter |
 | Blockchain | Solana — Jupiter v6, Helius RPC |
 
@@ -30,7 +30,7 @@ pip install -r requirements.txt
 uvicorn brotha_api:app --host 0.0.0.0 --port 8000
 ```
 
-Then open `brotha_dashboard.html` in your browser and connect to `http://localhost:8000`.
+Then open `dashboard.html` in your browser and connect to `http://localhost:8000`.
 
 ## Deploy free
 - **API** → [Railway.app](https://railway.app) or [Render.com](https://render.com)
